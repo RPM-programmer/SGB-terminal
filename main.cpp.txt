@@ -1,0 +1,444 @@
+#include <Arduino.h>
+#include <SoftwareSerial.h>
+#include <Wire.h>
+#include <Keypad.h>
+#include <LiquidCrystal_I2C.h>
+#include <Adafruit_PN532.h>
+#define LCD_I2C_ADDRESS 0x27 
+const String WIFI_SSID  = "/*WIFI-NAME*/";
+const String WIFI_PASS  = "/*WIFI-PASSWORD*/";
+const String SERVER_IP  = "/*PROXY-IP*/"; 
+const String SERVER_PORT = "8080";          
+SoftwareSerial espSerial(10, 11); 
+LiquidCrystal_I2C lcd(LCD_I2C_ADDRESS, 16, 2); 
+#define PN532_IRQ (13)      
+#define PN532_RESET (13)      
+Adafruit_PN532 nfc(PN532_IRQ, PN532_RESET);
+const int LED_GREEN = A0;
+const int LED_RED = A1;
+const int BTN_CANCEL_PIN = 12;
+const byte ROWS = 4; 
+const byte COLS = 4; 
+char hexaKeys[ROWS][COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+byte rowPins[ROWS] = {9, 8, 7, 6};    
+byte colPins[COLS] = {5, 4, 3, 2};    
+Keypad customKeypad = Keypad(makeKeymap(hexaKeys), rowPins, colPins, ROWS, COLS);
+String pinBuffer = "";
+String accountBuffer = ""; 
+String amountBuffer = "";   
+String cardUidStr = ""; 
+bool cardScanned = false;
+enum ATMMode {
+  MODE_WELCOME,
+  MODE_REG_SCAN,         
+  MODE_REG_ACCOUNT,      
+  MODE_REG_PIN,          
+  MODE_REG_CONFIRM,      
+  MODE_TRF_ACCOUNT,
+  MODE_TRF_AMOUNT,
+  MODE_TRF_PIN,   
+  MODE_TRF_SCAN, 
+  MODE_TRF_CONFIRM 
+};
+ATMMode atmMode = MODE_WELCOME;
+class ESP01_Helper {
+private:
+  SoftwareSerial* serial;
+  bool sendAT(String cmd, const char* expectedResponse, unsigned long timeoutMs) {
+    serial->println(cmd);
+    unsigned long startTime = millis();
+    String response = "";
+    while (millis() - startTime < timeoutMs) {
+      while (serial->available() > 0) {
+        char c = serial->read();
+        response += c;
+        if (response.indexOf(expectedResponse) != -1) {
+          return true; 
+        }
+      }
+    }
+    return false; 
+  }
+public:
+  ESP01_Helper(SoftwareSerial* s) { serial = s; }
+  bool init() {
+    serial->begin(9600); 
+    delay(300);
+    if (sendAT("AT", "OK", 1000)) {
+      setupModes();
+      return true;
+    }
+    serial->begin(115200); 
+    delay(300);
+    if (sendAT("AT", "OK", 1000)) {
+      serial->println("AT+UART_DEF=9600,8,1,0,0");
+      delay(300);
+      serial->begin(9600);
+      delay(200);
+      if (sendAT("AT", "OK", 1000)) {
+        setupModes();
+        return true;
+      }
+    }
+    return false;
+  }
+  void setupModes() {
+    sendAT("AT+CWMODE=1", "OK", 1000);
+    sendAT("AT+CIPMUX=0", "OK", 1000);
+  }
+  bool connectWiFi(String ssid, String pass) {
+    String cmd = "AT+CWJAP=\"" + ssid + "\",\"" + pass + "\"";
+    return sendAT(cmd, "WIFI CONNECTED", 10000); 
+  }
+  int sendPostRequest(String ip, String port, String json, String endpoint) {
+    String connectCmd = "AT+CIPSTART=\"TCP\",\"" + ip + "\"," + port;
+    if (!sendAT(connectCmd, "CONNECT", 4000)) {
+      return 503; 
+    }
+    String httpRequest = "POST " + endpoint + " HTTP/1.1\r\n";
+    httpRequest += "Host: " + ip + "\r\n";
+    httpRequest += "Content-Type: application/json\r\n";
+    httpRequest += "Content-Length: " + String(json.length()) + "\r\n";
+    httpRequest += "Connection: close\r\n\r\n";
+    httpRequest += json; 
+    String sendCmd = "AT+CIPSEND=" + String(httpRequest.length());
+    if (!sendAT(sendCmd, ">", 2000)) {
+      sendAT("AT+CIPCLOSE", "OK", 1000);
+      return 500;
+    }
+    serial->print(httpRequest);
+    unsigned long startTime = millis();
+    String serverAnswer = "";
+    int finalStatusCode = 0;
+    while (millis() - startTime < 5000) { 
+      while (serial->available() > 0) {
+        char c = serial->read();
+        serverAnswer += c;
+        if (serverAnswer.indexOf("\r\n") != -1 && finalStatusCode == 0) {
+          int httpPos = serverAnswer.indexOf("HTTP/1.1 ");
+          if (httpPos != -1) {
+            finalStatusCode = serverAnswer.substring(httpPos + 9, httpPos + 12).toInt(); 
+          }
+        }
+      }
+      if (serverAnswer.indexOf("CLOSED") != -1) break;
+    }
+    sendAT("AT+CIPCLOSE", "OK", 500); 
+    return (finalStatusCode != 0) ? finalStatusCode : 408; 
+  }
+};
+ESP01_Helper esp(&espSerial);
+void showWelcomeScreen();
+void resetTerminal();
+void setup() {
+  Serial.begin(9600);      
+  Wire.begin();            
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_RED, OUTPUT);
+  pinMode(BTN_CANCEL_PIN, INPUT_PULLUP);
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Init ESP-01...  ");
+  if (esp.init()) {
+    lcd.setCursor(0, 1);
+    lcd.print("Connecting Wi-Fi");
+    if (esp.connectWiFi(WIFI_SSID, WIFI_PASS)) {
+      lcd.clear();
+      lcd.print("Wi-Fi Connected!");
+      delay(1500);
+    } else {
+      lcd.clear();
+      lcd.print("Wi-Fi Error!");
+      while(1);
+    }
+  } else {
+    lcd.clear();
+    lcd.print("ESP-01 Not Found");
+    while (1);
+  }
+  nfc.begin();
+  uint32_t versiondata = nfc.getFirmwareVersion();
+  if (!versiondata) {
+    lcd.clear();
+    lcd.print("NFC Error!");
+    while (1);
+  }
+  nfc.SAMConfig();
+  showWelcomeScreen();
+}
+void loop() {
+  char key = customKeypad.getKey();
+  if (digitalRead(BTN_CANCEL_PIN) == LOW) {
+    static unsigned long lastDebounce = 0;
+    if (millis() - lastDebounce > 200) {
+      lastDebounce = millis();
+      resetTerminal();
+      return;
+    }
+  }
+  if (atmMode == MODE_WELCOME && !cardScanned && key) {
+    if (key == 'A') {
+      atmMode = MODE_REG_SCAN;
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Privyazat kartu ");
+      lcd.setCursor(0, 1);
+      lcd.print("Prikladyvaite   ");
+      return;
+    } 
+    else if (key == 'B') {
+      atmMode = MODE_TRF_ACCOUNT;
+      accountBuffer = "";
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Perevod         ");
+      lcd.setCursor(0, 1);
+      lcd.print("vvedite schet   ");
+      delay(1500);
+      lcd.setCursor(0, 1);
+      lcd.print("                ");
+      lcd.setCursor(0, 1);
+      return;
+    }
+  }
+  if (!cardScanned && (atmMode == MODE_REG_SCAN || atmMode == MODE_TRF_SCAN)) {
+    uint8_t uid[] = { 0, 0, 0, 0, 0, 0, 0 };  
+    uint8_t uidLength;                        
+    bool success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 20);
+    if (success) {
+      cardUidStr = "";
+      for (uint8_t i = 0; i < uidLength; i++) {
+        if (uid[i] < 0x10) cardUidStr += "0";
+        cardUidStr += String(uid[i], HEX);
+      }
+      cardUidStr.toUpperCase(); 
+      cardScanned = true;
+      lcd.clear();
+      
+      if (atmMode == MODE_REG_SCAN) {
+        digitalWrite(LED_GREEN, HIGH);
+        lcd.print("Uspeshno");
+        delay(1500);
+        digitalWrite(LED_GREEN, LOW);
+        
+        atmMode = MODE_REG_ACCOUNT;
+        accountBuffer = "";
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Vvedite schet:");
+      } 
+      else if (atmMode == MODE_TRF_SCAN) {
+        atmMode = MODE_TRF_CONFIRM;
+        lcd.setCursor(0, 0);
+        lcd.print("Oformlyaete trf?");
+        lcd.setCursor(0, 1);
+        lcd.print("C - Da / D - Net");
+      }
+    }
+  }
+  if (atmMode == MODE_TRF_ACCOUNT && key) {
+    if (key == '#') {
+      if (accountBuffer.length() > 0) {
+        atmMode = MODE_TRF_AMOUNT;
+        amountBuffer = "";
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("vvedite summu:");
+      }
+    } 
+    else if (key == '*') {
+      if (accountBuffer.length() > 0) {
+        accountBuffer.remove(accountBuffer.length() - 1);
+        lcd.setCursor(0, 1);
+        lcd.print("                ");
+        lcd.setCursor(0, 1);
+        lcd.print(accountBuffer);
+      }
+    } 
+    else if (key >= '0' && key <= '9') {
+      if (accountBuffer.length() < 16) {
+        accountBuffer += key;
+        lcd.setCursor(0, 1);
+        lcd.print(accountBuffer);
+      }
+    }
+  }
+  else if (atmMode == MODE_TRF_AMOUNT && key) {
+    if (key == '#') {
+      if (amountBuffer.length() > 0) {
+        atmMode = MODE_TRF_PIN;
+        pinBuffer = "";
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("vvedite pincode:");
+      }
+    } 
+    else if (key == '*') {
+      if (amountBuffer.length() > 0) {
+        amountBuffer.remove(amountBuffer.length() - 1);
+        lcd.setCursor(0, 1);
+        lcd.print("                ");
+        lcd.setCursor(0, 1);
+        lcd.print(amountBuffer);
+      }
+    } 
+    else if (key >= '0' && key <= '9') {
+      if (amountBuffer.length() < 6) { 
+        amountBuffer += key;
+        lcd.setCursor(0, 1);
+        lcd.print(amountBuffer);
+      }
+    }
+  }
+  else if (atmMode == MODE_TRF_PIN && key) {
+    if (key == '#') {
+      if (pinBuffer.length() == 4) {
+        atmMode = MODE_TRF_SCAN;
+        cardScanned = false;
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Prikladyvaite   ");
+        lcd.setCursor(0, 1);
+        lcd.print("kartu...        ");
+      }
+    } 
+    else if (key == '*') {
+      if (pinBuffer.length() > 0) {
+        pinBuffer.remove(pinBuffer.length() - 1);
+        lcd.setCursor(0, 1);
+        lcd.print("                ");
+        lcd.setCursor(0, 1);
+        for (size_t i = 0; i < pinBuffer.length(); i++) lcd.print("*");
+      }
+      }
+else if (pinBuffer.length() < 4 && key >= '0' && key <= '9') {
+pinBuffer += key;
+lcd.setCursor(0, 1);
+for (size_t i = 0; i < pinBuffer.length(); i++) lcd.print("*");
+}
+}
+  else if (atmMode == MODE_TRF_CONFIRM && key) {
+    if (key == 'C') {
+      lcd.clear();
+      lcd.print("Sending Trf...");
+      String trfJson = "{\"card\":\"" + cardUidStr + "\",\"to\":\"" + accountBuffer + "\",\"pincode\":\"" + pinBuffer + "\",\"manny\":\"" + amountBuffer + "\"}";
+      int statusCode = esp.sendPostRequest(SERVER_IP, SERVER_PORT, trfJson, "/api/terminal/transfer");
+      lcd.clear();
+      if (statusCode == 200) {
+        digitalWrite(LED_GREEN, HIGH);
+        lcd.print("Sucess");
+        delay(3000);
+      } else {
+        digitalWrite(LED_RED, HIGH);
+        lcd.print("Error: ");
+        lcd.print(statusCode);
+        delay(3000);
+      }
+      resetTerminal();
+    }
+    else if (key == 'D') {
+      resetTerminal();
+    }
+  }
+  else if (atmMode == MODE_REG_ACCOUNT && key) {
+    if (key == '#') {
+      if (accountBuffer.length() > 0) {
+        atmMode = MODE_REG_PIN;
+        pinBuffer = "";
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Vvedite pincode:");
+      }
+    } 
+    else if (key == '*') {
+      if (accountBuffer.length() > 0) {
+        accountBuffer.remove(accountBuffer.length() - 1);
+        lcd.setCursor(0, 1);
+        lcd.print("                ");
+        lcd.setCursor(0, 1);
+        lcd.print(accountBuffer);
+      }
+    } 
+    else if (key >= '0' && key <= '9') {
+      if (accountBuffer.length() < 16) {
+        accountBuffer += key;
+        lcd.setCursor(0, 1);
+        lcd.print(accountBuffer);
+      }
+    }
+  }
+  else if (atmMode == MODE_REG_PIN && key) {
+    if (key == '#') {
+      if (pinBuffer.length() == 4) {
+        atmMode = MODE_REG_CONFIRM;
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("C - OK");
+        lcd.setCursor(0, 1);
+        lcd.print("D - Cancel");
+      }
+    } 
+    else if (key == '*') {
+      if (pinBuffer.length() > 0) {
+        pinBuffer.remove(pinBuffer.length() - 1);
+        lcd.setCursor(0, 1);
+        lcd.print("                ");
+        lcd.setCursor(0, 1);
+        for (size_t i = 0; i < pinBuffer.length(); i++) lcd.print("*");
+      }
+    } 
+    else if (pinBuffer.length() < 4 && key >= '0' && key <= '9') {
+      pinBuffer += key;
+      lcd.setCursor(0, 1);
+      for (size_t i = 0; i < pinBuffer.length(); i++) lcd.print("*");
+    }
+  }
+  else if (atmMode == MODE_REG_CONFIRM && key) {
+    if (key == 'C') {
+      lcd.clear();
+      lcd.print("Sending Reg...");
+      String regJson = "{\"id\":\"" + accountBuffer + "\",\"pincode\":\"" + pinBuffer + "\",\"card\":\"" + cardUidStr + "\"}";
+      int statusCode = esp.sendPostRequest(SERVER_IP, SERVER_PORT, regJson, "/api/terminal/register");
+      lcd.clear();
+      if (statusCode == 200) {
+        digitalWrite(LED_GREEN, HIGH);
+        lcd.print("Sucess");
+        lcd.setCursor(0, 1);
+        lcd.print("Card is link");
+        delay(4000);
+      } else {
+        digitalWrite(LED_RED, HIGH);
+        lcd.print("Error!");
+        delay(3000);
+      }
+      resetTerminal();
+    } 
+    else if (key == 'D') {
+      resetTerminal();
+    }
+  }
+}
+void showWelcomeScreen() {
+digitalWrite(LED_GREEN, LOW);
+digitalWrite(LED_RED, LOW);
+lcd.clear();
+lcd.setCursor(0, 0);
+lcd.print("  City-Bank ATM ");
+lcd.setCursor(0, 1);
+lcd.print("A-Reg  /  B-Trf ");
+}
+void resetTerminal() {
+cardScanned = false;
+pinBuffer = "";
+accountBuffer = "";
+amountBuffer = "";
+cardUidStr = "";
+atmMode = MODE_WELCOME;
+showWelcomeScreen();
+}
